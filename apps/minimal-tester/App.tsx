@@ -1,4 +1,5 @@
 import { useEvent } from 'expo';
+import { fetch as expoFetch } from 'expo/fetch';
 import * as AppleAuthentication from 'expo-apple-authentication';
 import { BlurView } from 'expo-blur';
 import { CameraView, useCameraPermissions, CameraType } from 'expo-camera';
@@ -50,6 +51,7 @@ export default function App() {
           isFabricEnabled: {isFabricEnabled + ''}
         </Text>
 
+        <FetchStreamReproExample />
         <ImageExample />
         <LinearGradientExample />
         {Platform.OS === 'ios' && <BlurExample />}
@@ -58,6 +60,146 @@ export default function App() {
         <AppleAuthenticationExample />
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+const EXPECTED_ORDER = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+const EXPECTED_STR = EXPECTED_ORDER.join(', ');
+
+export function FetchStreamReproExample() {
+  const [status, setStatus] = useState<'idle' | 'running'>('idle');
+  const [iteration, setIteration] = useState(0);
+  const [totalRuns, setTotalRuns] = useState(0);
+  const [failures, setFailures] = useState<string[]>([]);
+  const [lastOrder, setLastOrder] = useState('');
+  const [lastError, setLastError] = useState('');
+  const abortRef = useRef(false);
+
+  const runSingleFetch = useCallback(async (): Promise<{ tokens: string[]; error?: string }> => {
+    const url = `http://127.0.0.1:9001/stream`;
+
+    try {
+      const response = await expoFetch(url);
+      if (!response.body) {
+        return { tokens: [], error: 'No response.body available' };
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      const tokens: string[] = [];
+      const tokenRegex = /\[\[([A-H])\]\]/g;
+
+      while (tokens.length < 8) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        let match: RegExpExecArray | null;
+        while ((match = tokenRegex.exec(buffer)) != null) {
+          tokens.push(match[1]);
+          if (tokens.length >= 8) {
+            break;
+          }
+        }
+        buffer = buffer.slice(Math.max(0, buffer.length - 32));
+      }
+
+      try {
+        await reader.cancel();
+      } catch {
+        // Ignore cancel errors (separate issue)
+      }
+      return { tokens };
+    } catch (error: unknown) {
+      return { tokens: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  }, []);
+
+  const runRepro = useCallback(
+    async (iterations: number) => {
+      setStatus('running');
+      setIteration(0);
+      setTotalRuns(iterations);
+      setFailures([]);
+      setLastOrder('');
+      setLastError('');
+      abortRef.current = false;
+
+      const newFailures: string[] = [];
+
+      for (let i = 0; i < iterations && !abortRef.current; i++) {
+        setIteration(i + 1);
+        const result = await runSingleFetch();
+
+        if (result.error) {
+          setLastError(result.error);
+          // Don't count errors as failures for the race condition
+          continue;
+        }
+
+        const order = result.tokens.join(', ');
+        setLastOrder(order);
+
+        if (order !== EXPECTED_STR) {
+          const missing = EXPECTED_ORDER.filter((t) => !result.tokens.includes(t));
+          const label =
+            missing.length > 0
+              ? `#${i + 1}: ${order} (LOST: ${missing.join(',')})`
+              : `#${i + 1}: ${order} (OUT-OF-ORDER)`;
+          newFailures.push(label);
+          setFailures([...newFailures]);
+        }
+
+        // Small delay between iterations
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      setStatus('idle');
+    },
+    [runSingleFetch]
+  );
+
+  const stopRepro = useCallback(() => {
+    abortRef.current = true;
+  }, []);
+
+  const hostLabel = Platform.OS === 'android' ? '192.168.1.90 (LAN)' : '127.0.0.1';
+  const failureRate = totalRuns > 0 ? ((failures.length / totalRuns) * 100).toFixed(1) : '0';
+
+  return (
+    <View style={styles.exampleContainer}>
+      <Text style={styles.text}>Fetch stream repro</Text>
+      <Text>Server URL: http://{hostLabel}:9001/stream</Text>
+      <Text>Expected: {EXPECTED_STR}</Text>
+      <View style={styles.buttons}>
+        {status === 'idle' ? (
+          <>
+            <Button title="Run 1x" onPress={() => runRepro(1)} />
+            <Button title="Run 10x" onPress={() => runRepro(10)} />
+            <Button title="Run 50x" onPress={() => runRepro(50)} />
+          </>
+        ) : (
+          <Button title={`Stop (${iteration}/${totalRuns})`} onPress={stopRepro} />
+        )}
+      </View>
+      <Text>Last result: {lastOrder || '—'}</Text>
+      <Text style={{ color: failures.length > 0 ? 'red' : 'green', fontWeight: 'bold' }}>
+        Failures: {failures.length}/{totalRuns} ({failureRate}%)
+      </Text>
+      {failures.length > 0 && (
+        <View style={{ marginTop: 8 }}>
+          {failures.map((f, i) => (
+            <Text key={i} style={{ color: 'red', fontSize: 12 }}>
+              {f}
+            </Text>
+          ))}
+        </View>
+      )}
+      {lastError ? <Text style={{ color: 'orange' }}>Last error: {lastError}</Text> : null}
+    </View>
   );
 }
 
